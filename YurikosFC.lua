@@ -1,5 +1,5 @@
 -- language: Lua | executor: Delta / KRNL / Synapse
--- Grow a Garden | Dynamic NPC Quest — ikut rotasi NPC otomatis
+-- Grow a Garden | Anubis Quest — collect + submit verified
 
 local Players = game:GetService("Players")
 local RS      = game:GetService("ReplicatedStorage")
@@ -7,216 +7,130 @@ local GE      = RS:WaitForChild("GameEvents")
 local LP      = Players.LocalPlayer
 
 -- ══════════════════════════
--- REMOTES
+-- REMOTES — exact paths
 -- ══════════════════════════
-local SubmitRE   = GE:WaitForChild("SubmitFoodService_RE")
-local FoodCritRE = GE:WaitForChild("FoodCriticService_RE")
-local CollectRE  = GE:WaitForChild("Crops"):WaitForChild("Collect")
+local CollectRE = GE:WaitForChild("Crops"):WaitForChild("Collect")
+local SubmitRE  = GE:WaitForChild("Events")
+                   :WaitForChild("AnubisEvent")
+                   :WaitForChild("AncientArc")
+                   :WaitForChild("Submit")
+
+-- Token bisa berubah tiap sesi, baca dinamis kalau ada
+local function getToken()
+    local ok, val = pcall(function()
+        return GE.Events.AnubisEvent.AncientArc:FindFirstChild("Token")
+    end)
+    if ok and val and val:IsA("IntValue") then return val.Value end
+    return 3  -- default dari spy
+end
 
 -- ══════════════════════════
 -- CONFIG
 -- ══════════════════════════
 local CFG = {
-    autoSubmit  = false,
     autoCollect = false,
-    submitDelay = 2.5,
-    collectDelay = 3.0,
-    scanDelay   = 1.0,  -- seberapa sering cek tipe yang diminta NPC
+    autoSubmit  = false,
+    collectDelay = 0.8,
+    submitDelay  = 3.0,
 }
-
-local lastSubmit, lastCollect = 0, 0
-local currentWant = "unknown"  -- tipe tanaman yang diminta NPC saat ini
+local lastCollect, lastSubmit = 0, 0
 
 -- ══════════════════════════
--- FIND NPC
--- ══════════════════════════
-local function findQuestNPC()
-    for _, v in ipairs(workspace:GetDescendants()) do
-        if v:IsA("Model") then
-            local n = v.Name:lower()
-            -- Archeologist Archie, food critic, any NPC with thought bubble
-            if n:find("archie") or n:find("archaeolog") or n:find("food") 
-            or n:find("critic") or n:find("anubis") or n:find("quest") then
-                return v
-            end
-        end
-    end
-    -- fallback: cari NPC yang punya BillboardGui dengan teks "Looking for"
-    for _, v in ipairs(workspace:GetDescendants()) do
-        if v:IsA("BillboardGui") or v:IsA("SurfaceGui") then
-            for _, lbl in ipairs(v:GetDescendants()) do
-                if lbl:IsA("TextLabel") and lbl.Text:find("Looking for") then
-                    return v.Parent
-                end
-            end
-        end
-    end
-    return nil
-end
-
--- ══════════════════════════
--- READ WHAT NPC WANTS
--- baca thought bubble text, extract tipe tanaman
+-- READ NPC WANT
 -- ══════════════════════════
 local function readNPCWant()
-    -- coba baca dari workspace langsung (StringValue di NPC atau folder)
-    local function scanForWantText(root)
-        for _, v in ipairs(root:GetDescendants()) do
-            -- cek StringValue
-            if v:IsA("StringValue") then
-                local match = v.Value:match("[Ll]ooking for (.+) [Pp]lants?")
-                if match then return match:gsub("!",""):gsub("%s+$","") end
-                -- kadang langsung nama tipe saja
-                if v.Name:lower():find("want") or v.Name:lower():find("request") 
-                or v.Name:lower():find("type") then
-                    if #v.Value > 0 then return v.Value end
-                end
-            end
-            -- cek TextLabel (thought bubble)
-            if v:IsA("TextLabel") then
-                local t = v.Text
-                if t and #t > 0 then
-                    local match = t:match("[Ll]ooking for (.+) [Pp]lants?")
-                    if match then return match:gsub("!",""):gsub("%s+$","") end
-                    match = t:match("[Ll]ooking for (.+)!")
-                    if match then return match:gsub("%s+$","") end
-                end
-            end
-        end
-        return nil
+    -- coba baca dari AnubisEvent folder dulu
+    local ok, val = pcall(function()
+        return GE.Events.AnubisEvent:FindFirstChild("WantedPlant")
+            or GE.Events.AnubisEvent:FindFirstChild("CurrentPlant")
+            or GE.Events.AnubisEvent:FindFirstChild("PlantType")
+    end)
+    if ok and val and typeof(val.Value)=="string" and #val.Value>0 then
+        return val.Value
     end
 
-    -- scan NPC dulu
-    local npc = findQuestNPC()
-    if npc then
-        local w = scanForWantText(npc)
-        if w then return w end
-    end
-
-    -- scan seluruh workspace kalau tidak ketemu di NPC
-    return scanForWantText(workspace)
-end
-
--- ══════════════════════════
--- READ KG PROGRESS
--- ══════════════════════════
-local function readProgress()
+    -- fallback: baca thought bubble TextLabel di workspace
     for _, v in ipairs(workspace:GetDescendants()) do
         if v:IsA("TextLabel") then
-            local cur, max = v.Text:match("([%d%.]+)kg/([%d%.]+)kg")
-            if cur and max then
-                return tonumber(cur), tonumber(max)
-            end
+            local t = v.Text or ""
+            local m = t:match("[Ll]ooking for (.+) [Pp]lants?")
+                   or t:match("[Ww]ants? (.+) [Pp]lants?")
+            if m then return m:gsub("!",""):gsub("%s+$",""):gsub("^%s+","") end
         end
-    end
-    return nil, nil
-end
-
--- ══════════════════════════
--- FIND MY FARM
--- ══════════════════════════
-local function getMyFarm()
-    local farms = workspace:FindFirstChild("Farm") or workspace:FindFirstChild("Farms")
-    if not farms then return nil end
-    for _, farm in ipairs(farms:GetChildren()) do
-        local ok, mine = pcall(function()
-            local o = farm.Important.Data.Owner
-            if o:IsA("StringValue") then return o.Value == LP.Name end
-            if o:IsA("ObjectValue") then return o.Value == LP end
-            return false
-        end)
-        if ok and mine then return farm end
     end
     return nil
 end
 
 -- ══════════════════════════
--- COLLECT MATCHING CROPS
--- filter berdasarkan currentWant
+-- COLLECT — exact format dari spy
+-- satu fruit per FireServer({fruit})
+-- path: Workspace.Farm.Farm.Important.Plants_Physical.[Plant].Fruits.[Model]
 -- ══════════════════════════
 local function doCollect()
     if tick() - lastCollect < CFG.collectDelay then return end
     lastCollect = tick()
 
-    local farm = getMyFarm()
-    if not farm then setStatus("farm tidak ditemukan") return end
+    local plantsFolder = workspace:FindFirstChild("Farm")
+    if plantsFolder then plantsFolder = plantsFolder:FindFirstChild("Farm") end
+    if plantsFolder then plantsFolder = plantsFolder:FindFirstChild("Important") end
+    if plantsFolder then plantsFolder = plantsFolder:FindFirstChild("Plants_Physical") end
 
-    local batch = {}
-    local wantLower = currentWant:lower()
+    if not plantsFolder then
+        setStatus("❌ Plants_Physical tidak ditemukan")
+        return
+    end
 
-    for _, v in ipairs(farm:GetDescendants()) do
-        if v:IsA("Model") then
-            local nameLower = v.Name:lower()
-            -- filter: kalau currentWant unknown, collect semua
-            -- kalau sudah diketahui, collect yang cocok saja
-            local match = (wantLower == "unknown")
-                or nameLower:find(wantLower, 1, true)
-                -- partial match untuk kategori (Vegetable, Fruit, dll)
-                or (wantLower:find("vegetable") and (
-                    nameLower:find("carrot") or nameLower:find("tomato")
-                    or nameLower:find("potato") or nameLower:find("pepper")
-                    or nameLower:find("corn") or nameLower:find("pumpkin")
-                    or nameLower:find("bean") or nameLower:find("kale")
-                    or nameLower:find("prickly") or nameLower:find("cactus")
-                    or nameLower:find("veggie") or nameLower:find("vegetable")
-                ))
-                or (wantLower:find("fruit") and (
-                    nameLower:find("berry") or nameLower:find("apple")
-                    or nameLower:find("mango") or nameLower:find("grape")
-                    or nameLower:find("kiwi") or nameLower:find("melon")
-                    or nameLower:find("fruit") or nameLower:find("peach")
-                    or nameLower:find("cherry") or nameLower:find("plum")
-                ))
-                or (wantLower:find("flower") and (
-                    nameLower:find("flower") or nameLower:find("rose")
-                    or nameLower:find("daisy") or nameLower:find("tulip")
-                    or nameLower:find("orchid") or nameLower:find("lotus")
-                    or nameLower:find("blossom") or nameLower:find("bloom")
-                ))
-                or (wantLower:find("mushroom") and (
-                    nameLower:find("mushroom") or nameLower:find("shroom")
-                    or nameLower:find("fungi") or nameLower:find("fungus")
-                ))
+    local want = readNPCWant()
+    local wantLower = want and want:lower() or ""
+    local count = 0
 
-            if match then
-                table.insert(batch, v)
-                if #batch >= 12 then break end
+    for _, plantModel in ipairs(plantsFolder:GetChildren()) do
+        local plantName = plantModel.Name:lower()
+
+        -- filter sesuai NPC want
+        local match = (#wantLower == 0)
+            or plantName:find(wantLower, 1, true)
+            or wantLower:find(plantName, 1, true)
+
+        if match then
+            local fruitsFolder = plantModel:FindFirstChild("Fruits")
+            if fruitsFolder then
+                for _, fruit in ipairs(fruitsFolder:GetChildren()) do
+                    if fruit:IsA("Model") then
+                        pcall(function()
+                            CollectRE:FireServer({fruit})
+                        end)
+                        count = count + 1
+                        task.wait(0.05)
+                    end
+                end
             end
         end
     end
 
-    if #batch > 0 then
-        pcall(function() CollectRE:FireServer(batch) end)
-        setStatus("collected " .. #batch .. " " .. currentWant)
+    if count > 0 then
+        setStatus("✓ collected "..count.." | ".. (want or "all"))
     else
-        setStatus("menunggu " .. currentWant .. " siap harvest")
+        setStatus("menunggu harvest | want: "..(want or "unknown"))
     end
 end
 
 -- ══════════════════════════
--- SUBMIT KE NPC
+-- SUBMIT — exact args dari SimpleSpy
+-- {Token=3, Mode="All"}
 -- ══════════════════════════
 local function doSubmit()
     if tick() - lastSubmit < CFG.submitDelay then return end
     lastSubmit = tick()
 
-    local cur, max = readProgress()
-
-    -- kalau sudah penuh, submit
-    pcall(function() SubmitRE:FireServer("Submit All") end)
-    task.wait(0.1)
-    pcall(function() SubmitRE:FireServer(true) end)
-    task.wait(0.1)
-    pcall(function() FoodCritRE:FireServer("Submit All") end)
-    task.wait(0.1)
-    -- coba tanpa argumen juga
-    pcall(function() SubmitRE:FireServer() end)
-
-    if cur and max then
-        setStatus(string.format("submit ✓ | %.1f/%.1fkg", cur, max))
-    else
-        setStatus("submitted ✓")
-    end
+    local token = getToken()
+    pcall(function()
+        SubmitRE:FireServer({
+            Token = token,
+            Mode  = "All"
+        })
+    end)
+    setStatus("✓ submitted | token="..token)
 end
 
 -- ══════════════════════════
@@ -233,28 +147,25 @@ gui.ResetOnSpawn = false
 gui.Parent = guiParent
 
 local main = Instance.new("Frame")
-main.Size = UDim2.new(0, 230, 0, 285)
-main.Position = UDim2.new(0, 14, 0.25, 0)
-main.BackgroundColor3 = Color3.fromRGB(10, 12, 20)
+main.Size = UDim2.new(0, 232, 0, 290)
+main.Position = UDim2.new(0, 14, 0.22, 0)
+main.BackgroundColor3 = Color3.fromRGB(10,12,20)
 main.BorderSizePixel = 0
 main.Active = true
 main.Parent = gui
-Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
+Instance.new("UICorner", main).CornerRadius = UDim.new(0,8)
 
--- drag
-local drag, ds, sp = false, nil, nil
+local drag,ds,sp=false,nil,nil
 main.InputBegan:Connect(function(i)
     if i.UserInputType==Enum.UserInputType.Touch
     or i.UserInputType==Enum.UserInputType.MouseButton1 then
-        drag=true; ds=i.Position; sp=main.Position
-    end
+        drag=true;ds=i.Position;sp=main.Position end
 end)
 main.InputChanged:Connect(function(i)
-    if drag and (i.UserInputType==Enum.UserInputType.Touch
+    if drag and(i.UserInputType==Enum.UserInputType.Touch
     or i.UserInputType==Enum.UserInputType.MouseMovement) then
         local d=i.Position-ds
-        main.Position=UDim2.new(sp.X.Scale,sp.X.Offset+d.X,sp.Y.Scale,sp.Y.Offset+d.Y)
-    end
+        main.Position=UDim2.new(sp.X.Scale,sp.X.Offset+d.X,sp.Y.Scale,sp.Y.Offset+d.Y) end
 end)
 main.InputEnded:Connect(function(i)
     if i.UserInputType==Enum.UserInputType.Touch
@@ -262,27 +173,134 @@ main.InputEnded:Connect(function(i)
 end)
 
 -- header
-local hdr = Instance.new("Frame", main)
-hdr.Size = UDim2.new(1,0,0,34)
-hdr.BackgroundColor3 = Color3.fromRGB(18,20,36)
-hdr.BorderSizePixel = 0
-Instance.new("UICorner",hdr).CornerRadius = UDim.new(0,8)
+local hdr=Instance.new("Frame",main)
+hdr.Size=UDim2.new(1,0,0,34)
+hdr.BackgroundColor3=Color3.fromRGB(18,20,36)
+hdr.BorderSizePixel=0
+Instance.new("UICorner",hdr).CornerRadius=UDim.new(0,8)
+local htxt=Instance.new("TextLabel",hdr)
+htxt.Size=UDim2.new(1,-10,1,0)
+htxt.Position=UDim2.new(0,10,0,0)
+htxt.BackgroundTransparency=1
+htxt.Font=Enum.Font.GothamBold
+htxt.TextSize=12
+htxt.TextColor3=Color3.fromRGB(200,170,80)
+htxt.TextXAlignment=Enum.TextXAlignment.Left
+htxt.Text="𓂀  ANUBIS QUEST"
 
-local htxt = Instance.new("TextLabel", hdr)
-htxt.Size = UDim2.new(1,-10,1,0)
-htxt.Position = UDim2.new(0,10,0,0)
-htxt.BackgroundTransparency = 1
-htxt.Font = Enum.Font.GothamBold
-htxt.TextSize = 12
-htxt.TextColor3 = Color3.fromRGB(200,170,80)
-htxt.TextXAlignment = Enum.TextXAlignment.Left
-htxt.Text = "𓂀  NPC QUEST"
+-- want label
+local wantLbl=Instance.new("TextLabel",main)
+wantLbl.Size=UDim2.new(1,-16,0,20)
+wantLbl.Position=UDim2.new(0,8,0,38)
+wantLbl.BackgroundTransparency=1
+wantLbl.Font=Enum.Font.GothamBold
+wantLbl.TextSize=11
+wantLbl.TextColor3=Color3.fromRGB(100,220,140)
+wantLbl.TextXAlignment=Enum.TextXAlignment.Left
+wantLbl.Text="NPC wants: scanning..."
 
--- want label (tipe yang diminta NPC)
-local wantLbl = Instance.new("TextLabel", main)
-wantLbl.Size = UDim2.new(1,-16,0,22)
-wantLbl.Position = UDim2.new(0,8,0,38)
-wantLbl.BackgroundTransparency = 1
+-- progress label
+local progLbl=Instance.new("TextLabel",main)
+progLbl.Size=UDim2.new(1,-16,0,16)
+progLbl.Position=UDim2.new(0,8,0,58)
+progLbl.BackgroundTransparency=1
+progLbl.Font=Enum.Font.Code
+progLbl.TextSize=10
+progLbl.TextColor3=Color3.fromRGB(150,160,200)
+progLbl.TextXAlignment=Enum.TextXAlignment.Left
+progLbl.Text="progress: —"
+
+-- status
+local statusLbl=Instance.new("TextLabel",main)
+statusLbl.Size=UDim2.new(1,-16,0,18)
+statusLbl.Position=UDim2.new(0,8,1,-24)
+statusLbl.BackgroundTransparency=1
+statusLbl.Font=Enum.Font.Code
+statusLbl.TextSize=10
+statusLbl.TextColor3=Color3.fromRGB(80,90,130)
+statusLbl.TextXAlignment=Enum.TextXAlignment.Left
+statusLbl.Text="ready"
+
+function setStatus(msg) statusLbl.Text=msg end
+
+local COL_OFF=Color3.fromRGB(22,25,42)
+local COL_ON=Color3.fromRGB(50,55,120)
+local TXT_OFF=Color3.fromRGB(140,145,185)
+local TXT_ON=Color3.fromRGB(210,220,255)
+
+local function makeToggle(label,yPos,onToggle)
+    local b=Instance.new("TextButton",main)
+    b.Size=UDim2.new(1,-16,0,34)
+    b.Position=UDim2.new(0,8,0,yPos)
+    b.BackgroundColor3=COL_OFF
+    b.TextColor3=TXT_OFF
+    b.Font=Enum.Font.Gotham
+    b.TextSize=12
+    b.BorderSizePixel=0
+    b.Text="  ○  "..label
+    b.TextXAlignment=Enum.TextXAlignment.Left
+    Instance.new("UICorner",b).CornerRadius=UDim.new(0,6)
+    local s=false
+    b.MouseButton1Click:Connect(function()
+        s=not s
+        b.BackgroundColor3=s and COL_ON or COL_OFF
+        b.TextColor3=s and TXT_ON or TXT_OFF
+        b.Text=(s and"  ●  "or"  ○  ")..label
+        onToggle(s)
+    end)
+end
+
+-- manual buttons
+local function makeManual(label,color,textColor,yPos,onClick)
+    local b=Instance.new("TextButton",main)
+    b.Size=UDim2.new(0.46,0,0,30)
+    b.Position=UDim2.new(yPos,0,0,78)
+    b.BackgroundColor3=color
+    b.TextColor3=textColor
+    b.Font=Enum.Font.GothamBold
+    b.TextSize=11
+    b.BorderSizePixel=0
+    b.Text=label
+    Instance.new("UICorner",b).CornerRadius=UDim.new(0,6)
+    b.MouseButton1Click:Connect(onClick)
+end
+
+makeManual("⚡ Collect",Color3.fromRGB(20,60,30),Color3.fromRGB(100,220,140),0.04,doCollect)
+makeManual("📤 Submit", Color3.fromRGB(60,45,10),Color3.fromRGB(220,180,80),0.52,doSubmit)
+
+makeToggle("Auto Collect", 116, function(on) CFG.autoCollect=on end)
+makeToggle("Auto Submit",  158, function(on) CFG.autoSubmit=on end)
+
+-- ══════════════════════════
+-- MAIN LOOP
+-- ══════════════════════════
+task.spawn(function()
+    while true do
+        task.wait(1)
+
+        -- update NPC want display
+        local w=readNPCWant()
+        if w then wantLbl.Text="NPC wants: "..w
+        else wantLbl.Text="NPC wants: scanning..." end
+
+        -- update progress
+        for _,v in ipairs(workspace:GetDescendants()) do
+            if v:IsA("TextLabel") then
+                local cur,max=v.Text:match("([%d%.]+)kg/([%d%.]+)kg")
+                if cur and max then
+                    progLbl.Text=cur.."kg / "..max.."kg"
+                    break
+                end
+            end
+        end
+
+        if CFG.autoCollect then doCollect() end
+        if CFG.autoSubmit  then doSubmit()  end
+    end
+end)
+
+setStatus("loaded ✓")
+print("[AnubisQuest] collect + submit verified — ready")Lbl.BackgroundTransparency = 1
 wantLbl.Font = Enum.Font.GothamBold
 wantLbl.TextSize = 12
 wantLbl.TextColor3 = Color3.fromRGB(100,220,140)
